@@ -1,0 +1,4 @@
+/workspace/problem_019/build/CMakeFiles/code.dir
+/workspace/problem_019/build/CMakeFiles/test.dir
+/workspace/problem_019/build/CMakeFiles/edit_cache.dir
+/workspace/problem_019/build/CMakeFiles/rebuild_cache.dir
