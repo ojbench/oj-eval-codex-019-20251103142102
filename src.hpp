@@ -6,6 +6,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                Rater &rater, GpuSimulator &gpu_sim,
                MatrixMemoryAllocator matrix_memory_allocator) {
   assert(keys.size() == values.size());
+  Matrix *k_sram_stack = nullptr; // persistent across rounds
+  Matrix *v_sram_stack = nullptr; // persistent across rounds
   for (size_t i = 0; i < keys.size(); ++i) {
     auto current_query = rater.GetNextQuery();
     /*
@@ -20,55 +22,48 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
      * automatically.
      */
 
-    /* Build K stack for keys[0..i] by vertical concat in HBM */
-    Matrix *k_stack = nullptr;
+    /* Prepare progressive K/V stacks in SRAM by appending current rows */
+    // Prepare K row copy in HBM then move to SRAM
+    Matrix *k_row_hbm = matrix_memory_allocator.Allocate("k_row_hbm");
+    gpu_sim.Copy(keys[i], k_row_hbm, Position::kInGpuHbm);
+    gpu_sim.MoveMatrixToSharedMem(k_row_hbm);
     if (i == 0) {
-      Matrix *k_copy = matrix_memory_allocator.Allocate("k_copy");
-      gpu_sim.Copy(keys[0], k_copy, Position::kInGpuHbm);
-      k_stack = k_copy;
+      k_sram_stack = k_row_hbm;
     } else {
-      Matrix *cur = keys[0];
-      for (size_t j = 1; j <= i; ++j) {
-        Matrix *next_concat = matrix_memory_allocator.Allocate("k_concat");
-        gpu_sim.Concat(cur, keys[j], next_concat, /*axis=*/0, Position::kInGpuHbm);
-        if (cur != keys[0]) {
-          gpu_sim.ReleaseMatrix(cur);
-        }
-        cur = next_concat;
-      }
-      k_stack = cur;
+      Matrix *new_k_stack = matrix_memory_allocator.Allocate("k_stack_sram");
+      gpu_sim.Concat(k_sram_stack, k_row_hbm, new_k_stack, /*axis=*/0, Position::kInSharedMemory);
+      gpu_sim.ReleaseMatrix(k_sram_stack);
+      gpu_sim.ReleaseMatrix(k_row_hbm);
+      k_sram_stack = new_k_stack;
     }
 
-    /* Build V stack for values[0..i] by vertical concat in HBM */
-    Matrix *v_stack = nullptr;
+    // Prepare V row copy similarly
+    Matrix *v_row_hbm = matrix_memory_allocator.Allocate("v_row_hbm");
+    gpu_sim.Copy(values[i], v_row_hbm, Position::kInGpuHbm);
+    gpu_sim.MoveMatrixToSharedMem(v_row_hbm);
     if (i == 0) {
-      Matrix *v_copy = matrix_memory_allocator.Allocate("v_copy");
-      gpu_sim.Copy(values[0], v_copy, Position::kInGpuHbm);
-      v_stack = v_copy;
+      v_sram_stack = v_row_hbm;
     } else {
-      Matrix *cur = values[0];
-      for (size_t j = 1; j <= i; ++j) {
-        Matrix *next_concat = matrix_memory_allocator.Allocate("v_concat");
-        gpu_sim.Concat(cur, values[j], next_concat, /*axis=*/0, Position::kInGpuHbm);
-        if (cur != values[0]) {
-          gpu_sim.ReleaseMatrix(cur);
-        }
-        cur = next_concat;
-      }
-      v_stack = cur;
+      Matrix *new_v_stack = matrix_memory_allocator.Allocate("v_stack_sram");
+      gpu_sim.Concat(v_sram_stack, v_row_hbm, new_v_stack, /*axis=*/0, Position::kInSharedMemory);
+      gpu_sim.ReleaseMatrix(v_sram_stack);
+      gpu_sim.ReleaseMatrix(v_row_hbm);
+      v_sram_stack = new_v_stack;
     }
 
-    /* Move operands needed for MatMul to shared memory */
-    gpu_sim.MoveMatrixToSharedMem(current_query);
-    if (k_stack->GetPosition() != Position::kInSharedMemory)
-      gpu_sim.MoveMatrixToSharedMem(k_stack);
+    /* Copy current query to avoid mutating original, then move copy to SRAM */
+    Matrix *q_copy = matrix_memory_allocator.Allocate("q_copy");
+    gpu_sim.Copy(current_query, q_copy, Position::kInGpuHbm);
+    gpu_sim.MoveMatrixToSharedMem(q_copy);
 
-    /* Transpose K to get K^T in SRAM */
-    gpu_sim.Transpose(k_stack, Position::kInSharedMemory);
+    /* Create K^T as a copy so we don't mutate persistent k_sram_stack */
+    Matrix *k_t = matrix_memory_allocator.Allocate("k_t");
+    gpu_sim.Copy(k_sram_stack, k_t, Position::kInSharedMemory);
+    gpu_sim.Transpose(k_t, Position::kInSharedMemory);
 
     /* logits = Q * K^T (shape (i+1, i+1)) in SRAM */
     Matrix *logits = matrix_memory_allocator.Allocate("logits");
-    gpu_sim.MatMul(current_query, k_stack, logits);
+    gpu_sim.MatMul(q_copy, k_t, logits);
 
     /* Softmax row-wise on logits to produce attn (i+1, i+1) in SRAM */
     Matrix *attn = nullptr;
@@ -102,19 +97,15 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       }
     }
 
-    /* Prepare V stack in SRAM for final matmul */
-    if (v_stack->GetPosition() != Position::kInSharedMemory)
-      gpu_sim.MoveMatrixToSharedMem(v_stack);
-
     /* out = softmax(QK^T) * V (shape (i+1, d)) in SRAM */
     Matrix *out = matrix_memory_allocator.Allocate("out");
-    gpu_sim.MatMul(attn, v_stack, out);
+    gpu_sim.MatMul(attn, v_sram_stack, out);
 
     /* Release intermediates no longer needed */
-    gpu_sim.ReleaseMatrix(k_stack);
+    gpu_sim.ReleaseMatrix(k_t);
     gpu_sim.ReleaseMatrix(logits);
     gpu_sim.ReleaseMatrix(attn);
-    gpu_sim.ReleaseMatrix(v_stack);
+    gpu_sim.ReleaseMatrix(q_copy);
 
     /* Move result to HBM for commit */
     gpu_sim.MoveMatrixToGpuHbm(out);
