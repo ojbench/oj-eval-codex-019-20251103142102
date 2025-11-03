@@ -93,7 +93,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_mat);
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(row_sum);
-      gpu_sim.ReleaseMatrix(row_soft);
+      if (row != 0) {
+        gpu_sim.ReleaseMatrix(row_soft);
+      }
     }
 
     /* Prepare V stack in SRAM for final matmul */
