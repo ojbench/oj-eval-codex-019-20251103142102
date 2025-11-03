@@ -23,7 +23,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     /* Build K stack for keys[0..i] by vertical concat in HBM */
     Matrix *k_stack = nullptr;
     if (i == 0) {
-      k_stack = keys[0];
+      Matrix *k_copy = matrix_memory_allocator.Allocate("k_copy");
+      gpu_sim.Copy(keys[0], k_copy, Position::kInGpuHbm);
+      k_stack = k_copy;
     } else {
       Matrix *cur = keys[0];
       for (size_t j = 1; j <= i; ++j) {
@@ -40,7 +42,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     /* Build V stack for values[0..i] by vertical concat in HBM */
     Matrix *v_stack = nullptr;
     if (i == 0) {
-      v_stack = values[0];
+      Matrix *v_copy = matrix_memory_allocator.Allocate("v_copy");
+      gpu_sim.Copy(values[0], v_copy, Position::kInGpuHbm);
+      v_stack = v_copy;
     } else {
       Matrix *cur = values[0];
       for (size_t j = 1; j <= i; ++j) {
@@ -110,6 +114,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.ReleaseMatrix(k_stack);
     gpu_sim.ReleaseMatrix(logits);
     gpu_sim.ReleaseMatrix(attn);
+    gpu_sim.ReleaseMatrix(v_stack);
 
     /* Move result to HBM for commit */
     gpu_sim.MoveMatrixToGpuHbm(out);
